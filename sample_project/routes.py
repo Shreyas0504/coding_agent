@@ -6,6 +6,30 @@ def hello_world():
     return "Hello, World!"
 
 
+def add_numbers(a, b):
+    return a + b
+
+
+def multiply_numbers(a, b):
+    return a * b
+
+
+def calculate_average(a, b, c):
+    return (a + b + c) / 3
+
+
+def average_numbers(a, b, c):
+    return calculate_average(a, b, c)
+
+
+def subtract_numbers(a, b):
+    return a - b
+
+
+def is_even(number):
+    return number % 2 == 0
+
+
 def register_user(name, age, email):
     if not is_valid_name(name):
         raise ValueError("Name is required.")

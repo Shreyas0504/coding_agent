@@ -9,10 +9,9 @@ practical way. The main focus is not on building a complicated AI system, but
 on creating a complete flow from understanding a task to making, testing, and
 showing a code change.
 
-## What the project does
+## What the project does:
 
 The agent can:
-
 - Take a coding task written in normal English.
 - Look through the files in `sample_project/`.
 - Find files that are likely related to the task using simple keyword-based

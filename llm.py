@@ -300,6 +300,7 @@ Rules:
 - files_to_read must contain only exact paths from CANDIDATE FILES above.
 - Candidate files are for inspection, not a statement that they must change.
 - Prefer existing relevant test files and never use tests/__init__.py as a test.
+- If the task asks to add or modify a test, include the relevant existing test file in files_to_read. Prefer an existing test file over creating a new test file when one already exists.
 - Reuse existing functionality and keep this plan minimal.
 - Every steps item must be a simple string.
 """
@@ -319,11 +320,19 @@ Rules:
     files_to_read = data["files_to_read"]
     steps = data["steps"]
     candidates = set(candidate_files)
+    available = set(available_files)
+    if not candidates.issubset(available):
+        raise ValueError("Invalid plan: candidate files must exist in the project.")
     if (
         not isinstance(data["task"], str)
         or not data["task"].strip()
         or not isinstance(files_to_read, list)
-        or any(not isinstance(path, str) or path not in candidates for path in files_to_read)
+        or any(
+            not isinstance(path, str)
+            or path not in candidates
+            or path not in available
+            for path in files_to_read
+        )
         or len(files_to_read) != len(set(files_to_read))
         or not isinstance(steps, list)
         or not all(isinstance(step, str) and step.strip() for step in steps)
@@ -334,13 +343,18 @@ Rules:
         )
 
     if re.search(r"\b(test|tests|testing|pytest)\b", task, flags=re.IGNORECASE):
-        route_test = "sample_project/tests/test_routes.py"
-        if (
-            "sample_project/routes.py" in understanding["likely_files"]
-            and route_test in candidates
-            and route_test not in files_to_read
-        ):
-            raise ValueError(f"Invalid plan: include the existing test file {route_test}.")
+        for source_file in understanding.get("likely_files", []):
+            if (
+                not isinstance(source_file, str)
+                or not source_file.startswith("sample_project/")
+                or source_file.startswith("sample_project/tests/")
+                or not source_file.endswith(".py")
+            ):
+                continue
+            module_name = source_file.rsplit("/", 1)[-1][:-3]
+            test_file = f"sample_project/tests/test_{module_name}.py"
+            if test_file in candidates and test_file not in files_to_read:
+                files_to_read.append(test_file)
 
     return data
 

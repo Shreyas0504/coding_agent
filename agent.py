@@ -1,3 +1,8 @@
+import ast
+import importlib
+import re
+import sys
+
 from llm import (
     create_plan,
     generate_change_request,
@@ -15,6 +20,181 @@ from tools import (
     run_tests,
     temporary_project_copy,
 )
+
+
+def _extract_task_numbers(task):
+    if not isinstance(task, str):
+        return []
+    values = []
+    for match in re.finditer(r"-?\d+(?:\.\d+)?", task):
+        number = match.group(0)
+        values.append(float(number) if "." in number else int(number))
+    return values
+
+
+def _task_requests_tests(task):
+    return bool(re.search(r"\b(test|tests|testing|pytest)\b", task, re.IGNORECASE))
+
+
+def _related_existing_test_files(source_files, available_files):
+    available = set(available_files)
+    test_files = []
+    for source_file in source_files:
+        if (
+            not isinstance(source_file, str)
+            or not source_file.startswith("sample_project/")
+            or source_file.startswith("sample_project/tests/")
+            or not source_file.endswith(".py")
+        ):
+            continue
+        module_name = source_file.rsplit("/", 1)[-1][:-3]
+        test_file = f"sample_project/tests/test_{module_name}.py"
+        if test_file in available and test_file not in test_files:
+            test_files.append(test_file)
+    return test_files
+
+
+def _detect_operation(task):
+    if not isinstance(task, str):
+        return None
+    lowered = task.lower()
+    operation_keywords = {
+        "add": ["add", "addition", "plus", "sum", "total", "increase"],
+        "multiply": ["multiply", "product", "times", "multiplied"],
+        "subtract": ["subtract", "difference", "minus", "decrease"],
+        "average": ["average", "avg", "mean"],
+        "is_even": ["even", "is_even", "parity"],
+    }
+    for operation, keywords in operation_keywords.items():
+        if any(keyword in lowered for keyword in keywords):
+            return operation
+    return None
+
+
+def _function_matches_operation(function_name, operation):
+    name = re.sub(r"[^a-z0-9]", "", function_name.lower())
+    operation_aliases = {
+        "add": ["add", "sum", "total"],
+        "multiply": ["multiply", "product"],
+        "subtract": ["subtract", "difference", "minus"],
+        "average": ["average", "mean", "avg"],
+        "is_even": ["iseven", "even", "parity"],
+    }
+    aliases = operation_aliases.get(operation, [])
+    return any(alias in name for alias in aliases)
+
+
+def _get_function_definitions(project_root, file_paths):
+    functions = []
+    for file_path in file_paths:
+        if not file_path.startswith("sample_project/") or not file_path.endswith(".py"):
+            continue
+        try:
+            source = read_file(file_path, project_root=project_root)
+            tree = ast.parse(source)
+        except Exception:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                functions.append({
+                    "file": file_path,
+                    "name": node.name,
+                    "arg_count": len(node.args.args) + len(node.args.kwonlyargs),
+                })
+    return functions
+
+
+def _safe_run_generated_function(task, project_root, change_request=None):
+    unavailable = {
+        "available": False,
+        "success": False,
+        "message": "Execution result is not available for this change.",
+    }
+
+    if not isinstance(task, str) or not task.strip():
+        return unavailable
+
+    numbers = _extract_task_numbers(task)
+    if not numbers:
+        return unavailable
+
+    operation = _detect_operation(task)
+    files_to_scan = []
+    if isinstance(change_request, dict):
+        for change in change_request.get("changes", []):
+            if isinstance(change, dict):
+                file_path = change.get("file")
+                if isinstance(file_path, str):
+                    files_to_scan.append(file_path)
+        for file_path in change_request.get("files_to_change", []):
+            if isinstance(file_path, str):
+                files_to_scan.append(file_path)
+    files_to_scan = list(dict.fromkeys(files_to_scan))
+    if not files_to_scan:
+        files_to_scan = list_files(project_root)
+
+    functions = _get_function_definitions(project_root, files_to_scan)
+    if not functions:
+        return unavailable
+
+    matching_function = None
+    if operation:
+        matches = [
+            item for item in functions
+            if _function_matches_operation(item["name"], operation)
+        ]
+        if matches:
+            matching_function = matches[0]
+    if matching_function is None and len(functions) == 1:
+        matching_function = functions[0]
+    if matching_function is None:
+        return unavailable
+
+    desired_count = matching_function["arg_count"] or 1
+    if operation == "average":
+        desired_count = max(1, min(len(numbers), max(3, desired_count)))
+        desired_count = max(3, min(len(numbers), desired_count))
+        if len(numbers) < 3:
+            return unavailable
+    elif operation == "is_even":
+        desired_count = 1
+    elif operation in {"add", "multiply", "subtract"}:
+        desired_count = min(2, len(numbers))
+        if desired_count < 2:
+            return unavailable
+    else:
+        desired_count = min(desired_count, len(numbers))
+        if desired_count < 1:
+            return unavailable
+
+    args = numbers[:desired_count]
+    if operation == "average":
+        args = numbers[:3]
+    if operation == "is_even":
+        args = [numbers[0]]
+    if operation in {"add", "multiply", "subtract"}:
+        args = numbers[:2]
+
+    module_name = matching_function["file"].replace("/", ".")[:-3]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
+    try:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, matching_function["name"]):
+            return unavailable
+        function = getattr(module, matching_function["name"])
+        output = function(*args)
+    except Exception:
+        return unavailable
+
+    return {
+        "function": matching_function["name"],
+        "arguments": [int(value) if isinstance(value, float) and value.is_integer() else value for value in args],
+        "output": output,
+        "success": True,
+        "available": True,
+    }
 
 
 def analyze_task(task):
@@ -40,6 +220,17 @@ def analyze_task(task):
         candidate_files,
         file_contents,
     )
+    if _task_requests_tests(task):
+        related_tests = _related_existing_test_files(
+            task_understanding["likely_files"],
+            available_files,
+        )
+        for test_file in related_tests:
+            if test_file not in candidate_files:
+                candidate_files.append(test_file)
+                file_contents[test_file] = read_file(test_file)
+            if test_file not in task_understanding["likely_files"]:
+                task_understanding["likely_files"].append(test_file)
     requested_new_files = explicit_new_files(task, available_files)
     if not task_understanding["likely_files"] and not requested_new_files:
         raise ValueError(
@@ -203,6 +394,11 @@ def run_agent(approved_analysis):
         test_result,
         diff_output,
     )
+
+    execution_result = None
+    if test_result.get("success"):
+        execution_result = _safe_run_generated_function(task, temp_root, change_request)
+
     return {
         **approved_analysis,
         "changes": change_request,
@@ -211,4 +407,5 @@ def run_agent(approved_analysis):
         "repair_attempted": repair_attempted,
         "diff": diff_output,
         "final_explanation": summary_result,
+        "execution_result": execution_result,
     }
